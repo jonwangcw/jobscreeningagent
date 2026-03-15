@@ -1,0 +1,28 @@
+schedule:
+  cron: "0 2 * * *"           # 2am nightly
+
+embedding:
+  model: "all-MiniLM-L6-v2"
+  similarity_threshold: 0.28
+  extraction_chars: 2000
+
+llm:
+  provider: "claude"           # claude | openai | ollama
+  model: "claude-sonnet-4-20250514"
+  max_tokens: 2048
+
+scoring:
+  weights:
+    role_type: 0.50
+    location: 0.30
+    stack: 0.20
+
+sources:
+  linkedin: true
+  indeed: true
+  careers_pages_file: "./profile/career_pages.txt"
+
+output_dir: "./outputs"
+profile_path: "./profile/profile.md"
+master_resume_path: "./profile/master_resume.docx"
+db_path: "./data/jobs.db"

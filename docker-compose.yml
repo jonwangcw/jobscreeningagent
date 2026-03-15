@@ -1,0 +1,20 @@
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data                  # SQLite DB persists here
+      - ./outputs:/app/outputs        # Generated materials persist here
+      - ./profile:/app/profile:ro     # Profile docs — read-only inside container
+    environment:
+      - DB_PATH=/data/jobs.db
+      - CONFIG_PATH=/app/config.yml
+    env_file:
+      - .env                          # ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]     # GPU passthrough for sentence-transformers
+    restart: unless-stopped
