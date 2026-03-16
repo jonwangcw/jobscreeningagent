@@ -42,7 +42,9 @@ job-agent/
 │   │   ├── base.py            ← abstract Scraper(ABC)
 │   │   ├── linkedin.py
 │   │   ├── indeed.py
-│   │   └── careers_page.py    ← reads curated URL list from config
+│   │   ├── careers_page.py    ← reads curated URL list from config; routes to simple or playwright scraper
+│   │   ├── playwright_scraper.py   ← Playwright + LLM scraper for JS-rendered job portals
+│   │   └── portal_prompts.py       ← all prompt strings for the Playwright scraper
 │   │
 │   ├── scoring/
 │   │   ├── __init__.py
@@ -247,10 +249,20 @@ sources:
   linkedin: true
   indeed: true
   careers_pages_file: "./profile/career_pages.txt"
+  playwright: true             # set false to disable PlaywrightLLMScraper entirely
+
+playwright:
+  headless: true
+  nav_timeout_ms: 30000        # page.goto() timeout
+  wait_timeout_ms: 10000       # element/networkidle wait timeout
+  snapshot_max_chars: 12000    # max chars of page snapshot sent to LLM
+  max_pages: 10                # max pagination pages per portal entry
+  max_explore_steps: 8         # max LLM-guided exploration steps for unknown portals
 
 output_dir: "./outputs"
 profile_path: "./profile/profile.md"
 master_resume_path: "./profile/master_resume.docx"
+db_path: "./data/jobs.db"
 ```
 
 ---
@@ -318,6 +330,8 @@ empty string — it does not crash.
 1. Write to `profile/profile.md` or `profile/master_resume.docx`
 2. Delete rows from the `jobs` table (set status='rejected' instead)
 3. Hardcode API keys, model names, thresholds, or file paths — all go in `config.yml`
-4. Put prompt strings anywhere except `agent/scoring/prompts.py`
+4. Put scoring prompt strings anywhere except `agent/scoring/prompts.py`
 5. Put raw SQL anywhere except `agent/db/repository.py`
 6. Make the generation pipeline run automatically — it is always user-triggered
+7. Put prompt strings for the Playwright scraper anywhere except `agent/ingest/portal_prompts.py`
+8. Write to `./data/portal_cache.json` directly — always go through the `_ExploreCache` helpers in `agent/ingest/playwright_scraper.py`

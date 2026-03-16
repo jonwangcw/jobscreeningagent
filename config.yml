@@ -21,6 +21,15 @@ sources:
   linkedin: true
   indeed: true
   careers_pages_file: "./profile/career_pages.txt"
+  playwright: true             # set false to disable PlaywrightLLMScraper entirely
+
+playwright:
+  headless: true
+  nav_timeout_ms: 30000        # page.goto() timeout
+  wait_timeout_ms: 10000       # element/networkidle wait timeout
+  snapshot_max_chars: 12000    # max chars of page snapshot sent to LLM
+  max_pages: 10                # max pagination pages per portal entry
+  max_explore_steps: 8         # max LLM-guided exploration steps for unknown portals
 
 output_dir: "./outputs"
 profile_path: "./profile/profile.md"

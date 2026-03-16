@@ -30,6 +30,7 @@ _SEARCHES: list[tuple[str, str]] = [
     ("machine learning engineer", "Pittsburgh, PA"),
     ("data engineer", "Pittsburgh, PA"),
     ("AI engineer", "Pittsburgh, PA"),
+    ("data scientist", "Pittsburgh, PA"),
     ("machine learning engineer", "United States"),
     ("ML engineer remote", "United States"),
     ("AI safety", "United States"),

@@ -18,7 +18,7 @@ import yaml
 
 from agent.db.repository import JobRepository
 from agent.ingest.base import RawPosting
-from agent.ingest.careers_page import CareersPageScraper
+from agent.ingest.careers_page import CareersPageScraper, build_careers_scrapers
 from agent.ingest.indeed import IndeedScraper
 from agent.ingest.linkedin import LinkedInScraper
 from agent.scoring.llm_scorer import build_llm_backend
@@ -42,18 +42,31 @@ def run_pipeline(config: dict[str, Any]) -> dict[str, int]:
     llm = build_llm_backend(config["llm"])
     scoring = ScoringPipeline(config, llm)
 
-    # 1. Scrape in parallel
+    # 1. Build scrapers
     scrapers = []
     if config.get("sources", {}).get("indeed", True):
         scrapers.append(IndeedScraper())
     if config.get("sources", {}).get("linkedin", True):
         scrapers.append(LinkedInScraper())
+
     careers_file = config.get("sources", {}).get("careers_pages_file")
+    use_playwright = config.get("sources", {}).get("playwright", True)
+
     if careers_file:
-        scrapers.append(CareersPageScraper(careers_file))
+        if use_playwright:
+            # build_careers_scrapers returns CareersPageScraper instances for simple
+            # entries and PlaywrightLLMScraper instances for portal entries.
+            careers_scrapers = build_careers_scrapers(
+                careers_pages_file=careers_file,
+                llm_config=config["llm"],
+            )
+            scrapers.extend(careers_scrapers)
+        else:
+            # Playwright disabled — fall back to simple HTTP scraper only
+            scrapers.append(CareersPageScraper(careers_file))
 
     all_postings: list[RawPosting] = []
-    with ThreadPoolExecutor(max_workers=len(scrapers) or 1) as pool:
+    with ThreadPoolExecutor(max_workers=max(len(scrapers), 1)) as pool:
         futures = {pool.submit(s.fetch): type(s).__name__ for s in scrapers}
         for future in as_completed(futures):
             name = futures[future]

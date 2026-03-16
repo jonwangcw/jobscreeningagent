@@ -12,11 +12,34 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Install Python deps
+# System packages needed by Playwright's Chromium and sentence-transformers
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Chromium runtime dependencies
+    libnss3 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libpango-1.0-0 \
+    # Sentence-transformers / torch build deps
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python deps (includes playwright and pydantic)
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e ".[dev]" \
-    && pip install --no-cache-dir playwright \
-    && playwright install chromium --with-deps
+RUN pip install --no-cache-dir -e ".[dev]"
+
+# Install Playwright browser (Chromium only — smallest footprint)
+RUN playwright install chromium
 
 # Copy application source
 COPY agent/ ./agent/

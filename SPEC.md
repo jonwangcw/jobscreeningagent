@@ -22,13 +22,19 @@ manually from the dashboard — the agent never applies to jobs autonomously.
 - LinkedIn (scrape or unofficial API)
 - Indeed (scrape or RSS feed)
 - Curated company career pages (URL list in config.yml)
+- JavaScript-rendered job portals via `PlaywrightLLMScraper` (Workday, Eightfold, Greenhouse, Taleo, Phenom, etc.)
 
 **Behavior:**
 - All scrapers run concurrently via `ThreadPoolExecutor`
-- The careers page scraper reads `profile/career_pages.txt` — one entry per
-  line in the format `https://example.com/careers | Company Name`. Lines
-  starting with `#` are treated as comments and skipped. The file path is
-  read from `config.sources.careers_pages_file`.
+- The careers page scraper reads `profile/career_pages.txt`. The file supports two line formats:
+  - Simple (two columns): `https://example.com/careers | Company Name`
+  - Portal (three columns): `https://example.com/careers | Company Name | portal=workday;keywords=ml,data engineer`
+  - Lines starting with `#` are treated as comments and skipped
+  - The file path is read from `config.sources.careers_pages_file`
+- Two-column entries go to `CareersPageScraper` (httpx + BeautifulSoup heuristic)
+- Three-column entries go to `PlaywrightLLMScraper` (Playwright browser + LLM-guided extraction)
+- `build_careers_scrapers()` in `careers_page.py` is the factory that routes entries to the correct scraper
+- The `playwright` toggle in `config.sources` disables `PlaywrightLLMScraper` entirely when `false`
 - Each returns a list of `RawPosting` dataclasses:
   ```python
   @dataclass
@@ -375,10 +381,20 @@ sources:
   linkedin: true
   indeed: true
   careers_pages_file: "./profile/career_pages.txt"
+  playwright: true             # set false to disable PlaywrightLLMScraper entirely
+
+playwright:
+  headless: true
+  nav_timeout_ms: 30000
+  wait_timeout_ms: 10000
+  snapshot_max_chars: 12000
+  max_pages: 10
+  max_explore_steps: 8
 
 output_dir: "./outputs"
 profile_path: "./profile/profile.md"
 master_resume_path: "./profile/master_resume.docx"
+db_path: "./data/jobs.db"
 ```
 
 ---
@@ -413,14 +429,33 @@ Missing sections → WARNING log, empty string substituted. Agent does not crash
 
 ## 7. career_pages.txt format
 
-One entry per line. Format: `URL | Company Name`. Lines beginning with `#` are comments.
+Two line formats are supported. Lines beginning with `#` are comments.
 
+**Simple format** — routed to `CareersPageScraper` (httpx + BeautifulSoup):
+```
+URL | Company Name
+```
+
+**Portal format** — routed to `PlaywrightLLMScraper` (Playwright + LLM):
+```
+URL | Company Name | portal=TYPE;keywords=kw1,kw2
+```
+
+The third column is a semicolon-separated list of `key=value` pairs:
+- `portal` — hint to the scraper: `workday` / `eightfold` / `greenhouse` / `taleo` / `phenom` / `brassring` / `talentbrew` / `custom_url_params` / `unknown`
+- `keywords` — comma-separated search terms. Defaults to the scraper's built-in keyword list if absent.
+
+Example file:
 ```
 # Pittsburgh-area companies
 https://careers.bosch.com | Bosch
 https://duolingo.com/careers | Duolingo
 
-# Remote-friendly targets
+# JS-rendered portals (require Playwright)
+https://cmu.wd5.myworkdayjobs.com/CMU | Carnegie Mellon University | portal=workday
+https://pnc.eightfold.ai/careers | PNC Bank | portal=phenom;keywords=machine learning,data engineer
+
+# Remote-friendly targets (simple pages)
 https://jobs.lever.co/anthropic | Anthropic
 ```
 
@@ -438,6 +473,9 @@ takes effect on the next scheduled run — no restart required.
 - `tests/test_db.py`: in-memory SQLite, verify insert/update/query behavior
 - `tests/test_generation.py`: mock LLM, verify master_resume.docx is never
   modified, verify output folder structure
+- `tests/test_playwright_scraper.py`: mock Playwright + LLM backend; covers
+  parser backward-compat, Pydantic model validation, snapshot builder, per-portal
+  executors, retry logic, and full scraper integration
 
 All tests must pass with `pytest` in CI. No tests may make real HTTP or API calls.
 
@@ -481,6 +519,17 @@ All tests must pass with `pytest` in CI. No tests may make real HTTP or API call
 - Threshold tuning workflow (CLI command to re-run scoring with new threshold)
 - OpenAI + Ollama LLM backend impls
 - OpenAI embedding backend impl
+
+### Phase 6 — Playwright portal scraper ✅ (implemented 2026-03-15)
+- `agent/ingest/playwright_scraper.py` — `PlaywrightLLMScraper` with per-portal executors
+  (Workday, Eightfold, Greenhouse, Taleo, Phenom, Brassring, TalentBrew, custom URL params, unknown)
+- `agent/ingest/portal_prompts.py` — all LLM prompt strings for the Playwright scraper
+- `agent/ingest/careers_page.py` updated — `PortalConfig` dataclass, three-column parser,
+  `build_careers_scrapers()` factory, `_SimpleCareersScraperFromEntries` helper
+- `agent/main.py` updated — routes portal entries to `PlaywrightLLMScraper` via factory
+- `config.yml` updated — `sources.playwright` toggle + `playwright:` section
+- `tests/test_playwright_scraper.py` — full test coverage including parser backward-compat,
+  Pydantic validation, mocked LLM + Playwright integration tests
 
 ---
 
