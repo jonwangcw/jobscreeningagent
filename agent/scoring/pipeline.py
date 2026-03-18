@@ -191,7 +191,7 @@ class ScoringPipeline:
         )
 
         try:
-            raw_response = self._llm.complete(system_prompt, user_prompt)
+            raw_response = self._llm.complete(system_prompt, user_prompt, prefill="{")
         except Exception as exc:
             logger.error("LLM scoring failed for %s: %s", posting.title, exc)
             return ScoreResult(

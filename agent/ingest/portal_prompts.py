@@ -116,6 +116,22 @@ Workday-specific guidance:
 - Location filters (if present) can be used to filter for Pittsburgh or Remote
 - Pagination uses "Load More" buttons or page number links
 - Job URLs on Workday follow the pattern: <tenant>.myworkdayjobs.com/<site>/job/<id>
+- Workday search inputs vary by tenant version; try these selectors in order:
+    input[data-automation-id="keywordSearchInput"] — keyword search input (most common)
+    input[placeholder="Search for jobs or keywords"] — CMU-style placeholder
+    input[data-automation-id="searchBar"]        — modern wd5 tenants
+    input[data-automation-id="searchBox"]        — alternate automation ID
+    input[data-automation-id="Search"]           — older variant
+    input[placeholder*="Search" i]               — case-insensitive partial
+    [data-automation-id*="search" i]             — any search-related ID
+    input[aria-label*="Search" i]                — aria-label fallback
+
+If selectors listed under "Previously tried selectors (did not exist)" are given,
+do NOT suggest them again. Pick a different selector from the list above.
+
+CRITICAL: If the snapshot shows job listings with text like "JOBS FOUND" or "301 JOBS FOUND" or a list of job titles with locations and posting dates, return action="extract" IMMEDIATELY — do not attempt any more search actions. The jobs are already loaded and visible.
+
+If no jobs are visible yet, try search selectors in this order, but skip any listed in "Previously tried selectors".
 
 Your task: given the snapshot, decide the next action to find relevant job listings.
 
@@ -133,6 +149,57 @@ WORKDAY_EXPLORE_USER_PROMPT = """\
 Company: {company}
 Workday tenant URL: {current_url}
 Keywords to search: {keywords}
+Previously tried selectors (did not exist on page — do NOT suggest these again): {failed_selectors}
+Snapshot:
+{snapshot}
+"""
+
+# ---------------------------------------------------------------------------
+# System prompt: BrassRing (IBM Kenexa) portal — specialized navigation
+# ---------------------------------------------------------------------------
+
+BRASSRING_EXPLORE_SYSTEM_PROMPT = """\
+You are a web automation assistant navigating a BrassRing (IBM Kenexa) TGnewUI
+ATS job portal. BrassRing portals are Angular SPAs hosted on sjobs.brassring.com.
+
+BrassRing TGnewUI-specific guidance:
+- The keyword search input has id="kw" — this is the primary selector, always try it first
+- Alternate keyword selectors (try in order if #kw fails):
+    input[id='kw']
+    input[name='kw']
+    input[aria-label*='keyword' i]
+    input[placeholder*='keyword' i]
+- The search submit button selectors:
+    #btn-srch-submit
+    button[type='submit']
+    input[type='submit']
+- Job result links appear as: .jobtitle a, tr.data a[href*='req'], a[class*='job']
+- If you see "To apply, enter keyword or click Search" — the #kw input is present
+
+Workflow:
+  1. Type a keyword into #kw
+  2. Submit the form (click search button or press enter)
+  3. Extract visible job title links from results
+  4. Follow pagination if present
+
+If selectors listed under "Previously tried selectors" are given, do NOT suggest
+them again. Pick a different selector.
+
+Return ONLY valid JSON:
+{
+  "action": "<click | type_and_search | navigate | extract | pagination_next | done>",
+  "selector": "<CSS selector>",
+  "value": "<text to type, if type_and_search>",
+  "url": "<URL, if navigate>",
+  "reasoning": "<one sentence>"
+}
+"""
+
+BRASSRING_EXPLORE_USER_PROMPT = """\
+Company: {company}
+BrassRing portal URL: {current_url}
+Keywords to search: {keywords}
+Previously tried selectors (did not exist on page — do NOT suggest these again): {failed_selectors}
 Snapshot:
 {snapshot}
 """

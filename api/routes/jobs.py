@@ -79,9 +79,11 @@ def list_jobs(
     status: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
+    sort: Optional[str] = None,
     repo: JobRepository = Depends(get_repo),
 ):
-    jobs = repo.list_jobs(status=status, limit=limit, offset=offset)
+    resolved_sort = sort or ("recent" if status == "new" else "score")
+    jobs = repo.list_jobs(status=status, limit=limit, offset=offset, sort=resolved_sort)
     return [_job_to_response(j) for j in jobs]
 
 

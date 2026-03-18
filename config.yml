@@ -30,6 +30,7 @@ playwright:
   snapshot_max_chars: 12000    # max chars of page snapshot sent to LLM
   max_pages: 10                # max pagination pages per portal entry
   max_explore_steps: 8         # max LLM-guided exploration steps for unknown portals
+  trace_log: true              # write structured JSONL trace to logs/scrape_YYYYMMDD_HHMMSS.jsonl
 
 output_dir: "./outputs"
 profile_path: "./profile/profile.md"

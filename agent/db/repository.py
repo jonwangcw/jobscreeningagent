@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from agent.db.models import Base, Job
@@ -67,7 +68,12 @@ class JobRepository:
         )
         with self._Session() as session:
             session.add(job)
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                logger.warning("insert_job: duplicate posting_id %r — skipped", posting.posting_id)
+                return -1
             session.refresh(job)
             return job.id
 
@@ -75,12 +81,21 @@ class JobRepository:
     # Dashboard helpers
     # ------------------------------------------------------------------
 
-    def list_jobs(self, status: Optional[str] = None, limit: int = 200, offset: int = 0) -> list[Job]:
+    def list_jobs(
+        self,
+        status: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        sort: str = "score",
+    ) -> list[Job]:
         with self._Session() as session:
             q = session.query(Job)
             if status:
                 q = q.filter(Job.status == status)
-            q = q.order_by(Job.composite_score.desc().nullslast())
+            if sort == "recent":
+                q = q.order_by(Job.created_at.desc())
+            else:
+                q = q.order_by(Job.composite_score.desc().nullslast())
             q = q.limit(limit).offset(offset)
             jobs = q.all()
             session.expunge_all()

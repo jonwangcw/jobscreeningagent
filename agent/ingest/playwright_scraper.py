@@ -22,20 +22,24 @@ Config keys read from llm_config dict (passed from config.yml llm section):
 No hardcoded model names, thresholds, or paths.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import quote_plus, urlencode, urlparse, urlunparse
 
 from pydantic import BaseModel, Field, field_validator
 
 from agent.ingest.base import RawPosting, Scraper, clean_text
 from agent.ingest.careers_page import PortalConfig
 from agent.ingest.portal_prompts import (
+    BRASSRING_EXPLORE_SYSTEM_PROMPT,
+    BRASSRING_EXPLORE_USER_PROMPT,
     EIGHTFOLD_EXTRACT_SYSTEM_PROMPT,
     EIGHTFOLD_EXTRACT_USER_PROMPT,
     EXPLORE_PORTAL_SYSTEM_PROMPT,
@@ -175,6 +179,140 @@ _explore_cache = _ExploreCache()
 
 
 # ---------------------------------------------------------------------------
+# Structured trace logging
+# ---------------------------------------------------------------------------
+
+
+class ScrapeTrace:
+    """Thread-safe JSONL trace writer for the Playwright scraper.
+
+    Each event is one JSON object per line with a 'ts' timestamp, 'company',
+    'portal', 'event' fields, and event-specific data.
+
+    Disabled (all methods are no-ops) when path is None.
+
+    Event types:
+        navigate  — before every page.goto()
+        snapshot  — full rendered text after every _build_snapshot() call
+        llm_call  — full prompt + raw response after every LLM .complete() call
+        action    — each action attempted (type_and_search / click / navigate)
+        error     — exceptions in executor functions with context
+        result    — jobs_raw / jobs_after_filter at end of _scrape_portal_async
+    """
+
+    def __init__(self, path: str | None) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self._path is not None
+
+    def _write(self, entry: dict) -> None:
+        if not self._path:
+            return
+        entry["ts"] = datetime.utcnow().isoformat()
+        with self._lock:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def navigate(self, company: str, portal: str, url: str) -> None:
+        self._write({"event": "navigate", "company": company, "portal": portal, "url": url})
+
+    def snapshot(self, company: str, portal: str, url: str, text: str) -> None:
+        self._write({
+            "event": "snapshot",
+            "company": company,
+            "portal": portal,
+            "url": url,
+            "chars": len(text),
+            "text": text,
+        })
+
+    def llm_call(
+        self,
+        company: str,
+        portal: str,
+        call_type: str,
+        url: str,
+        user_prompt: str,
+        raw_response: str,
+        valid_json: bool,
+        parsed: Any = None,
+    ) -> None:
+        self._write({
+            "event": "llm_call",
+            "company": company,
+            "portal": portal,
+            "call_type": call_type,
+            "url": url,
+            "user_prompt": user_prompt,
+            "raw_response": raw_response,
+            "valid_json": valid_json,
+            "parsed": parsed,
+        })
+
+    def action(
+        self,
+        company: str,
+        portal: str,
+        url: str,
+        action_type: str,
+        selector: str | None,
+        value: str | None,
+        reasoning: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        self._write({
+            "event": "action",
+            "company": company,
+            "portal": portal,
+            "url": url,
+            "action_type": action_type,
+            "selector": selector,
+            "value": value,
+            "reasoning": reasoning,
+            "status": status,
+            "error": error,
+        })
+
+    def error(self, company: str, portal: str, url: str, error_type: str, **ctx: Any) -> None:
+        self._write({
+            "event": "error",
+            "company": company,
+            "portal": portal,
+            "url": url,
+            "error_type": error_type,
+            **ctx,
+        })
+
+    def result(self, company: str, portal: str, jobs_raw: int, jobs_after_filter: int) -> None:
+        self._write({
+            "event": "result",
+            "company": company,
+            "portal": portal,
+            "jobs_raw": jobs_raw,
+            "jobs_after_filter": jobs_after_filter,
+        })
+
+
+# Module-level trace instance — no-op by default, configured from main.py
+_trace: ScrapeTrace = ScrapeTrace(None)
+
+
+def configure_trace(path: str) -> None:
+    """Enable structured JSONL trace logging to the given file path.
+
+    Called from main.py when playwright.trace_log is set in config.yml.
+    The file is created (or appended to) on first write.
+    Safe to call multiple times — replaces the previous instance.
+    """
+    global _trace
+    _trace = ScrapeTrace(path)
+
+
+# ---------------------------------------------------------------------------
 # Snapshot builder
 # ---------------------------------------------------------------------------
 
@@ -229,6 +367,31 @@ def _build_snapshot(html: str, max_chars: int = _SNAPSHOT_MAX_CHARS) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _is_css_selector(s: str) -> bool:
+    """Return True if s looks like a CSS selector rather than a visible text label.
+
+    CSS selectors start with #, ., [, :, *, or a tag name (letter). A string
+    that starts with a letter followed by spaces or dashes is most likely a
+    visible text label returned by the LLM — those must be handled with
+    get_by_text() instead of page.click(selector).
+    """
+    if not s:
+        return False
+    # If it contains spaces or dashes early on, it's a text label
+    first_word = s.split()[0] if " " in s else s
+    if re.search(r'[\s]', s) or (re.match(r'^[a-zA-Z]', s) and "-" in first_word):
+        return False
+    return bool(re.match(r'^[#.\[:\*a-zA-Z]', s))
+
+
+async def _smart_click(page: Any, selector: str, timeout: int) -> None:
+    """Click an element identified by a CSS selector or visible text label."""
+    if _is_css_selector(selector):
+        await page.click(selector, timeout=timeout)
+    else:
+        await page.get_by_text(selector, exact=False).first.click(timeout=timeout)
+
+
 def _resolve_url(href: str, base_url: str) -> str:
     """Make href absolute using base_url."""
     if not href:
@@ -246,8 +409,44 @@ def _resolve_url(href: str, base_url: str) -> str:
 
 
 def _inject_keywords_into_url(url: str, keyword: str) -> str:
-    """Replace __KEYWORDS__ placeholder in URL with the given keyword."""
-    return url.replace("__KEYWORDS__", keyword)
+    """Replace __KEYWORDS__ placeholder in URL with the URL-encoded keyword."""
+    return url.replace("__KEYWORDS__", quote_plus(keyword))
+
+
+# ---------------------------------------------------------------------------
+# LLM JSON parse helper
+# ---------------------------------------------------------------------------
+
+
+def _parse_llm_json(raw: str, context: str) -> Any:
+    """Parse a JSON string returned by the LLM, stripping markdown fences if present.
+
+    Returns the parsed object, or raises json.JSONDecodeError on failure.
+    Logs the first 300 chars of the raw response on parse failure so the caller
+    can see exactly what the LLM sent.
+
+    context: a short label for warning messages (e.g. "extract_jobs/UPMC").
+    """
+    if not raw or not raw.strip():
+        raise json.JSONDecodeError("empty response", "", 0)
+
+    text = raw.strip()
+
+    # Strip markdown code fences: ```json\n...\n``` or ```\n...\n```
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        text = text.strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning(
+            "PlaywrightLLMScraper: JSON parse failure [%s] — raw response (first 300 chars): %r",
+            context,
+            raw[:300],
+        )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +461,10 @@ def _llm_extract_jobs(
     portal_type: str,
     base_url: str,
     keywords: list[str],
+    current_url: str = "",
 ) -> ExtractJobsResponse:
     """Call LLM to extract jobs from a page snapshot. Returns validated response."""
+    trace_url = current_url or base_url
     user = EXTRACT_JOBS_USER_PROMPT.format(
         company=company,
         portal_type=portal_type,
@@ -271,14 +472,15 @@ def _llm_extract_jobs(
         keywords=", ".join(keywords),
         snapshot=snapshot,
     )
+    raw = ""
     try:
-        raw = llm.complete(system=EXTRACT_JOBS_SYSTEM_PROMPT, user=user)
-        data = json.loads(raw)
-        return ExtractJobsResponse.model_validate(data)
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
-        logger.warning(
-            "PlaywrightLLMScraper: LLM extract_jobs parse error for %s: %s", company, exc
-        )
+        raw = llm.complete(system=EXTRACT_JOBS_SYSTEM_PROMPT, user=user, prefill="{")
+        data = _parse_llm_json(raw, f"extract_jobs/{company}")
+        result = ExtractJobsResponse.model_validate(data)
+        _trace.llm_call(company, portal_type, "extract", trace_url, user, raw, True, data)
+        return result
+    except (json.JSONDecodeError, ValueError, KeyError):
+        _trace.llm_call(company, portal_type, "extract", trace_url, user, raw, False, None)
         return ExtractJobsResponse()
 
 
@@ -289,14 +491,27 @@ def _llm_explore_portal(
     portal_type: str,
     current_url: str,
     keywords: list[str],
+    failed_selectors: list[str] | None = None,
 ) -> ExploreAction:
     """Call LLM to decide the next navigation action. Returns validated action."""
     if portal_type == "workday":
         system = WORKDAY_EXPLORE_SYSTEM_PROMPT
+        failed_str = ", ".join(failed_selectors) if failed_selectors else "none"
         user = WORKDAY_EXPLORE_USER_PROMPT.format(
             company=company,
             current_url=current_url,
             keywords=", ".join(keywords),
+            failed_selectors=failed_str,
+            snapshot=snapshot,
+        )
+    elif portal_type == "brassring":
+        system = BRASSRING_EXPLORE_SYSTEM_PROMPT
+        failed_str = ", ".join(failed_selectors) if failed_selectors else "none"
+        user = BRASSRING_EXPLORE_USER_PROMPT.format(
+            company=company,
+            current_url=current_url,
+            keywords=", ".join(keywords),
+            failed_selectors=failed_str,
             snapshot=snapshot,
         )
     elif portal_type == "eightfold":
@@ -317,33 +532,39 @@ def _llm_explore_portal(
             keywords=", ".join(keywords),
             snapshot=snapshot,
         )
+    raw = ""
     try:
-        raw = llm.complete(system=system, user=user)
-        data = json.loads(raw)
-        return ExploreAction.model_validate(data)
+        raw = llm.complete(system=system, user=user, prefill="{")
+        data = _parse_llm_json(raw, f"explore_portal/{company}")
+        result = ExploreAction.model_validate(data)
+        _trace.llm_call(company, portal_type, "explore", current_url, user, raw, True, data)
+        return result
     except (json.JSONDecodeError, ValueError, KeyError) as exc:
-        logger.warning(
-            "PlaywrightLLMScraper: LLM explore_portal parse error for %s: %s", company, exc
-        )
+        _trace.llm_call(company, portal_type, "explore", current_url, user, raw, False, None)
         return ExploreAction(action="done", reasoning=f"parse error: {exc}")
 
 
 def _llm_filter_jobs(
     llm: LLMBackend,
     titles: list[str],
+    company: str = "",
+    portal_type: str = "",
+    current_url: str = "",
 ) -> list[int]:
     """Call LLM to filter job titles for relevance. Returns list of relevant indices."""
     if not titles:
         return []
     numbered = "\n".join(f"{i}: {t}" for i, t in enumerate(titles))
     user = FILTER_JOBS_USER_PROMPT.format(titles_numbered=numbered)
+    raw = ""
     try:
-        raw = llm.complete(system=FILTER_JOBS_SYSTEM_PROMPT, user=user)
-        data = json.loads(raw)
+        raw = llm.complete(system=FILTER_JOBS_SYSTEM_PROMPT, user=user, prefill="{")
+        data = _parse_llm_json(raw, "filter_jobs")
         resp = FilterJobsResponse.model_validate(data)
+        _trace.llm_call(company, portal_type, "filter", current_url, user, raw, True, data)
         return resp.relevant_indices
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
-        logger.warning("PlaywrightLLMScraper: LLM filter_jobs parse error: %s", exc)
+    except (json.JSONDecodeError, ValueError, KeyError):
+        _trace.llm_call(company, portal_type, "filter", current_url, user, raw, False, None)
         # On failure, return all indices (be inclusive)
         return list(range(len(titles)))
 
@@ -363,7 +584,9 @@ async def _execute_workday(
     """Handle Workday ATS portals via LLM-guided exploration."""
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
+    failed_selectors: list[str] = []
 
+    _trace.navigate(company, "workday", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
@@ -371,12 +594,19 @@ async def _execute_workday(
         html = await page.content()
         snapshot = _build_snapshot(html)
         current_url = page.url
+        _trace.snapshot(company, "workday", current_url, snapshot)
 
-        action = _llm_explore_portal(llm, snapshot, company, "workday", current_url, keywords)
-        logger.debug("Workday explore action for %s: %s — %s", company, action.action, action.reasoning)
+        action = _llm_explore_portal(
+            llm, snapshot, company, "workday", current_url, keywords,
+            failed_selectors=failed_selectors,
+        )
+        logger.info("Workday [%s] step: %s — %s", company, action.action, action.reasoning)
 
         if action.action == "extract":
-            jobs_resp = _llm_extract_jobs(llm, snapshot, company, "workday", current_url, keywords)
+            jobs_resp = _llm_extract_jobs(
+                llm, snapshot, company, "workday", current_url, keywords,
+                current_url=current_url,
+            )
             all_jobs.extend(jobs_resp.jobs)
             if not jobs_resp.has_next_page:
                 break
@@ -395,24 +625,38 @@ async def _execute_workday(
             break
 
         elif action.action == "navigate" and action.url:
+            _trace.navigate(company, "workday", action.url)
             await page.goto(action.url, timeout=_NAV_TIMEOUT_MS)
             await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
         elif action.action == "click" and action.selector:
             try:
-                await page.click(action.selector, timeout=_WAIT_TIMEOUT_MS)
+                await _smart_click(page, action.selector, _WAIT_TIMEOUT_MS)
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, "workday", current_url, "click", action.selector, None, action.reasoning, "ok")
             except Exception as exc:
                 logger.warning("Workday click failed for %s selector=%r: %s", company, action.selector, exc)
+                _trace.action(company, "workday", current_url, "click", action.selector, None, action.reasoning, "exception", error=str(exc))
                 break
 
         elif action.action == "type_and_search" and action.selector and action.value:
             try:
+                el = await page.query_selector(action.selector)
+                if el is None:
+                    logger.warning(
+                        "Workday selector not found for %s: %r — adding to failed list",
+                        company, action.selector,
+                    )
+                    _trace.action(company, "workday", current_url, "type_and_search", action.selector, action.value, action.reasoning, "selector_not_found")
+                    failed_selectors.append(action.selector)
+                    continue
                 await page.fill(action.selector, action.value, timeout=_WAIT_TIMEOUT_MS)
                 await page.keyboard.press("Enter")
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, "workday", current_url, "type_and_search", action.selector, action.value, action.reasoning, "ok")
             except Exception as exc:
                 logger.warning("Workday search failed for %s: %s", company, exc)
+                _trace.action(company, "workday", current_url, "type_and_search", action.selector, action.value, action.reasoning, "exception", error=str(exc))
                 break
 
         else:
@@ -450,6 +694,7 @@ async def _execute_eightfold(
 
     page.on("response", handle_response)
 
+    _trace.navigate(company, "eightfold", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
@@ -464,7 +709,9 @@ async def _execute_eightfold(
                 await page.keyboard.press("Enter")
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
                 await page.wait_for_timeout(2000)
-        except Exception:
+                _trace.action(company, "eightfold", page.url, "type_and_search", "search_input", keyword, "keyword search", "ok")
+        except Exception as exc:
+            _trace.error(company, "eightfold", page.url, "search_failed", keyword=keyword, exception=str(exc))
             break
 
     # If we captured API responses, parse them
@@ -485,7 +732,8 @@ async def _execute_eightfold(
     if not all_jobs:
         html = await page.content()
         snapshot = _build_snapshot(html)
-        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "eightfold", url, keywords)
+        _trace.snapshot(company, "eightfold", page.url, snapshot)
+        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "eightfold", url, keywords, current_url=page.url)
         all_jobs.extend(jobs_resp.jobs)
 
     return all_jobs
@@ -502,6 +750,7 @@ async def _execute_taleo(
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
 
+    _trace.navigate(company, "taleo", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
@@ -509,7 +758,8 @@ async def _execute_taleo(
     for _page_num in range(_MAX_PAGES):
         html = await page.content()
         snapshot = _build_snapshot(html)
-        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "taleo", url, keywords)
+        _trace.snapshot(company, "taleo", page.url, snapshot)
+        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "taleo", url, keywords, current_url=page.url)
         all_jobs.extend(jobs_resp.jobs)
 
         if not jobs_resp.has_next_page:
@@ -545,12 +795,14 @@ async def _execute_greenhouse(
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
 
+    _trace.navigate(company, "greenhouse", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("domcontentloaded", timeout=_WAIT_TIMEOUT_MS)
 
     html = await page.content()
     snapshot = _build_snapshot(html)
-    jobs_resp = _llm_extract_jobs(llm, snapshot, company, "greenhouse", url, keywords)
+    _trace.snapshot(company, "greenhouse", page.url, snapshot)
+    jobs_resp = _llm_extract_jobs(llm, snapshot, company, "greenhouse", url, keywords, current_url=page.url)
     all_jobs.extend(jobs_resp.jobs)
 
     return all_jobs
@@ -567,6 +819,7 @@ async def _execute_phenom(
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
 
+    _trace.navigate(company, "phenom", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
@@ -581,13 +834,16 @@ async def _execute_phenom(
                 await page.keyboard.press("Enter")
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
                 await page.wait_for_timeout(2000)
+                _trace.action(company, "phenom", page.url, "type_and_search", "search_input", keyword, "keyword search", "ok")
 
                 html = await page.content()
                 snapshot = _build_snapshot(html)
-                jobs_resp = _llm_extract_jobs(llm, snapshot, company, "phenom", url, keywords)
+                _trace.snapshot(company, "phenom", page.url, snapshot)
+                jobs_resp = _llm_extract_jobs(llm, snapshot, company, "phenom", page.url, keywords, current_url=page.url)
                 all_jobs.extend(jobs_resp.jobs)
         except Exception as exc:
             logger.warning("Phenom search failed for %s keyword=%r: %s", company, keyword, exc)
+            _trace.error(company, "phenom", page.url, "search_failed", keyword=keyword, exception=str(exc))
 
     return all_jobs
 
@@ -602,28 +858,68 @@ async def _execute_brassring(
     """Handle Brassring (Kenexa) ATS portals — Angular SPA."""
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
+    failed_selectors: list[str] = []
 
+    _trace.navigate(company, "brassring", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
     await page.wait_for_timeout(3000)  # Brassring needs extra settle time
 
     html = await page.content()
     snapshot = _build_snapshot(html)
+    _trace.snapshot(company, "brassring", page.url, snapshot)
 
-    # Use LLM to figure out how to search
-    action = _llm_explore_portal(llm, snapshot, company, "brassring", page.url, keywords)
+    # Use LLM to decide how to search; retry if selector not found
+    for _ in range(_MAX_EXPLORE_STEPS):
+        action = _llm_explore_portal(llm, snapshot, company, "brassring", page.url, keywords, failed_selectors=failed_selectors)
 
-    if action.action == "type_and_search" and action.selector and action.value:
-        try:
-            await page.fill(action.selector, action.value)
-            await page.keyboard.press("Enter")
-            await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
-        except Exception as exc:
-            logger.warning("Brassring search failed for %s: %s", company, exc)
+        if action.action in ("extract", "done"):
+            break
+
+        if action.action == "type_and_search" and action.selector and action.value:
+            try:
+                el = await page.query_selector(action.selector)
+                if el is None:
+                    logger.warning("Brassring selector not found for %s: %r", company, action.selector)
+                    _trace.action(company, "brassring", page.url, "type_and_search", action.selector, action.value, action.reasoning, "selector_not_found")
+                    if action.selector not in failed_selectors:
+                        failed_selectors.append(action.selector)
+                    continue
+                await page.fill(action.selector, action.value, timeout=_WAIT_TIMEOUT_MS)
+                await page.keyboard.press("Enter")
+                await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, "brassring", page.url, "type_and_search", action.selector, action.value, action.reasoning, "ok")
+                break
+            except Exception as exc:
+                logger.warning("Brassring search failed for %s: %s", company, exc)
+                _trace.action(company, "brassring", page.url, "type_and_search", action.selector, action.value, action.reasoning, "exception", error=str(exc))
+                break
+
+        elif action.action == "click" and action.selector:
+            try:
+                el = await page.query_selector(action.selector)
+                if el is None:
+                    _trace.action(company, "brassring", page.url, "click", action.selector, None, action.reasoning, "selector_not_found")
+                    if action.selector not in failed_selectors:
+                        failed_selectors.append(action.selector)
+                    continue
+                await page.click(action.selector, timeout=_WAIT_TIMEOUT_MS)
+                await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, "brassring", page.url, "click", action.selector, None, action.reasoning, "ok")
+                html = await page.content()
+                snapshot = _build_snapshot(html)
+                _trace.snapshot(company, "brassring", page.url, snapshot)
+            except Exception as exc:
+                logger.warning("Brassring click failed for %s: %s", company, exc)
+                _trace.action(company, "brassring", page.url, "click", action.selector, None, action.reasoning, "exception", error=str(exc))
+                break
+        else:
+            break
 
     html = await page.content()
     snapshot = _build_snapshot(html)
-    jobs_resp = _llm_extract_jobs(llm, snapshot, company, "brassring", page.url, keywords)
+    _trace.snapshot(company, "brassring", page.url, snapshot)
+    jobs_resp = _llm_extract_jobs(llm, snapshot, company, "brassring", page.url, keywords, current_url=page.url)
     all_jobs.extend(jobs_resp.jobs)
 
     return all_jobs
@@ -640,13 +936,15 @@ async def _execute_talentbrew(
     keywords = portal_config.keywords or _DEFAULT_KEYWORDS
     all_jobs: list[JobItem] = []
 
+    _trace.navigate(company, "talentbrew", url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
     for _page_num in range(_MAX_PAGES):
         html = await page.content()
         snapshot = _build_snapshot(html)
-        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "talentbrew", page.url, keywords)
+        _trace.snapshot(company, "talentbrew", page.url, snapshot)
+        jobs_resp = _llm_extract_jobs(llm, snapshot, company, "talentbrew", page.url, keywords, current_url=page.url)
         all_jobs.extend(jobs_resp.jobs)
 
         if not jobs_resp.has_next_page:
@@ -689,16 +987,23 @@ async def _execute_custom_url_params(
     for keyword in search_targets:
         target_url = _inject_keywords_into_url(url, keyword) if has_placeholder else url
         try:
+            _trace.navigate(company, "custom_url_params", target_url)
             await page.goto(target_url, timeout=_NAV_TIMEOUT_MS)
             await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
             await page.wait_for_timeout(1500)
 
             html = await page.content()
             snapshot = _build_snapshot(html)
+            _trace.snapshot(company, "custom_url_params", page.url, snapshot)
             jobs_resp = _llm_extract_jobs(
-                llm, snapshot, company, "custom_url_params", page.url, keywords
+                llm, snapshot, company, "custom_url_params", page.url, keywords,
+                current_url=page.url,
             )
             for job in jobs_resp.jobs:
+                # When the LLM doesn't return a per-job URL, use the keyword-substituted
+                # search URL as fallback — never the template URL with __KEYWORDS__.
+                if not job.url:
+                    job.url = target_url
                 if job.title not in seen_titles:
                     seen_titles.add(job.title)
                     all_jobs.append(job)
@@ -706,6 +1011,7 @@ async def _execute_custom_url_params(
             logger.warning(
                 "custom_url_params failed for %s url=%r: %s", company, target_url, exc
             )
+            _trace.error(company, "custom_url_params", target_url, "navigation_failed", keyword=keyword, exception=str(exc))
 
     return all_jobs
 
@@ -730,13 +1036,24 @@ async def _execute_unknown(
     else:
         actions_to_replay = []
 
+    _trace.navigate(company, portal_config.portal_type, url)
     await page.goto(url, timeout=_NAV_TIMEOUT_MS)
     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+    
+    # Handle cookie consent if present
+    try:
+        cookie_accept = await page.query_selector("button:has-text('Accept'), button:has-text('Accept all'), #hs-eu-confirmation-button")
+        if cookie_accept:
+            await cookie_accept.click()
+            await page.wait_for_timeout(1000)
+    except Exception:
+        pass
 
     step = 0
     while step < _MAX_EXPLORE_STEPS:
         html = await page.content()
         snapshot = _build_snapshot(html)
+        _trace.snapshot(company, portal_config.portal_type, page.url, snapshot)
 
         # Use cached action if available for this step
         if actions_to_replay and step < len(actions_to_replay):
@@ -747,14 +1064,15 @@ async def _execute_unknown(
             )
 
         explore_actions.append(action)
-        logger.debug(
-            "Unknown portal explore step %d for %s: %s — %s",
-            step, company, action.action, action.reasoning,
+        logger.info(
+            "Unknown portal [%s] step %d: %s — %s",
+            company, step, action.action, action.reasoning,
         )
 
         if action.action == "extract":
             jobs_resp = _llm_extract_jobs(
-                llm, snapshot, company, portal_config.portal_type, page.url, keywords
+                llm, snapshot, company, portal_config.portal_type, page.url, keywords,
+                current_url=page.url,
             )
             all_jobs.extend(jobs_resp.jobs)
             # Cache the successful exploration path
@@ -780,29 +1098,44 @@ async def _execute_unknown(
             break
 
         elif action.action == "navigate" and action.url:
+            _trace.navigate(company, portal_config.portal_type, action.url)
+            _trace.action(company, portal_config.portal_type, page.url, "navigate", None, action.url, action.reasoning, "ok")
             await page.goto(action.url, timeout=_NAV_TIMEOUT_MS)
             await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
 
         elif action.action == "click" and action.selector:
             try:
-                await page.click(action.selector, timeout=_WAIT_TIMEOUT_MS)
+                await _smart_click(page, action.selector, _WAIT_TIMEOUT_MS)
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, portal_config.portal_type, page.url, "click", action.selector, None, action.reasoning, "ok")
             except Exception as exc:
                 logger.warning(
                     "Unknown portal click failed for %s selector=%r: %s",
                     company, action.selector, exc
                 )
+                _trace.action(company, portal_config.portal_type, page.url, "click", action.selector, None, action.reasoning, "exception", error=str(exc))
                 break
 
         elif action.action == "type_and_search" and action.selector and action.value:
             try:
+                el = await page.query_selector(action.selector)
+                if el is None:
+                    logger.warning(
+                        "Unknown portal selector not found for %s: %r — re-snapshotting",
+                        company, action.selector,
+                    )
+                    _trace.action(company, portal_config.portal_type, page.url, "type_and_search", action.selector, action.value, action.reasoning, "selector_not_found")
+                    step += 1
+                    continue
                 await page.fill(action.selector, action.value, timeout=_WAIT_TIMEOUT_MS)
                 await page.keyboard.press("Enter")
                 await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                _trace.action(company, portal_config.portal_type, page.url, "type_and_search", action.selector, action.value, action.reasoning, "ok")
             except Exception as exc:
                 logger.warning(
                     "Unknown portal search failed for %s: %s", company, exc
                 )
+                _trace.action(company, portal_config.portal_type, page.url, "type_and_search", action.selector, action.value, action.reasoning, "exception", error=str(exc))
                 break
 
         elif action.action == "pagination_next":
@@ -813,6 +1146,7 @@ async def _execute_unknown(
                 if next_btn:
                     await next_btn.click()
                     await page.wait_for_load_state("networkidle", timeout=_WAIT_TIMEOUT_MS)
+                    _trace.action(company, portal_config.portal_type, page.url, "pagination_next", None, None, action.reasoning, "ok")
                 else:
                     break
             except Exception:
@@ -889,7 +1223,12 @@ async def _scrape_portal_async(
 
     # LLM relevance filter on titles
     titles = [j.title for j in job_items]
-    relevant_indices = _llm_filter_jobs(llm, titles)
+    relevant_indices = _llm_filter_jobs(
+        llm, titles,
+        company=company,
+        portal_type=portal_config.portal_type,
+        current_url=url,
+    )
     relevant_set = set(relevant_indices)
 
     for i, item in enumerate(job_items):
@@ -897,12 +1236,15 @@ async def _scrape_portal_async(
             continue
 
         job_url = _resolve_url(item.url or "", url) if item.url else url
-        # Strip query params for stable dedup ID, unless URL has no path info
+        # Strip query params for stable dedup ID.
+        # If the URL has no unique path, append a title hash so distinct jobs
+        # from the same portal don't collide on the same posting_id.
         parsed = urlparse(job_url)
         if parsed.path and parsed.path not in ("/", ""):
             posting_id = urlunparse(parsed._replace(query="", fragment=""))
         else:
-            posting_id = job_url
+            title_hash = hashlib.md5(clean_text(item.title).encode()).hexdigest()[:8]
+            posting_id = f"{job_url.rstrip('/')}#t{title_hash}"
 
         remote_val: bool | None = item.remote
         if remote_val is None and item.location:
@@ -922,6 +1264,7 @@ async def _scrape_portal_async(
             )
         )
 
+    _trace.result(company, portal_config.portal_type, len(job_items), len(postings))
     return postings
 
 
