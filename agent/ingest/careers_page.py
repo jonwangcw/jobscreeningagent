@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+import certifi
 import httpx
 from bs4 import BeautifulSoup
 
@@ -36,9 +37,11 @@ logger = logging.getLogger(__name__)
 
 _HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 # Keywords that must appear in a job title to be considered relevant.
@@ -209,7 +212,7 @@ class CareersPageScraper(Scraper):
 
         for url, company in entries:
             try:
-                with httpx.Client(headers=_HEADERS, follow_redirects=True, timeout=20) as client:
+                with httpx.Client(headers=_HEADERS, follow_redirects=True, timeout=20, verify=certifi.where()) as client:
                     resp = client.get(url)
                     resp.raise_for_status()
                 found = _extract_postings(resp.text, url, company)
@@ -273,7 +276,7 @@ class _SimpleCareersScraperFromEntries(Scraper):
         postings: list[RawPosting] = []
         for entry in self._entries:
             try:
-                with httpx.Client(headers=_HEADERS, follow_redirects=True, timeout=20) as client:
+                with httpx.Client(headers=_HEADERS, follow_redirects=True, timeout=20, verify=certifi.where()) as client:
                     resp = client.get(entry.url)
                     resp.raise_for_status()
                 found = _extract_postings(resp.text, entry.url, entry.company)

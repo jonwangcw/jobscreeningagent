@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
@@ -13,8 +14,17 @@ logger = logging.getLogger(__name__)
 
 class LLMBackend(ABC):
     @abstractmethod
-    def complete(self, system: str, user: str) -> str:
-        """Send a system+user message pair; return the assistant response string."""
+    def complete(self, system: str, user: str, prefill: str = "") -> str:
+        """Send a system+user message pair; return the assistant response string.
+
+        prefill: if non-empty, inject an assistant turn containing this string
+        before the model generates. The model continues from that point.
+        The returned string includes the prefill prepended so callers always
+        receive a complete, parseable response.
+
+        Only ClaudeBackend honours prefill natively. Other backends accept the
+        parameter for interface compatibility but ignore it.
+        """
         ...
 
 
@@ -26,14 +36,19 @@ class ClaudeBackend(LLMBackend):
         self._model = model
         self._max_tokens = max_tokens
 
-    def complete(self, system: str, user: str) -> str:
+    def complete(self, system: str, user: str, prefill: str = "") -> str:
+        messages: list[dict] = [{"role": "user", "content": user}]
+        if prefill:
+            messages.append({"role": "assistant", "content": prefill})
         msg = self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
             system=system,
-            messages=[{"role": "user", "content": user}],
+            messages=messages,
         )
-        return msg.content[0].text
+        text = msg.content[0].text
+        # Claude's response does not include the prefill itself, so we prepend it
+        return prefill + text if prefill else text
 
 
 class OpenAIBackend(LLMBackend):
@@ -44,7 +59,7 @@ class OpenAIBackend(LLMBackend):
         self._model = model
         self._max_tokens = max_tokens
 
-    def complete(self, system: str, user: str) -> str:
+    def complete(self, system: str, user: str, prefill: str = "") -> str:
         resp = self._client.chat.completions.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -63,7 +78,7 @@ class OllamaBackend(LLMBackend):
         self._client = httpx.Client(base_url=base_url, timeout=120)
         self._model = model
 
-    def complete(self, system: str, user: str) -> str:
+    def complete(self, system: str, user: str, prefill: str = "") -> str:
         payload = {
             "model": self._model,
             "messages": [
@@ -94,10 +109,19 @@ def build_llm_backend(config: dict[str, Any]) -> LLMBackend:
         raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
+def _strip_fences(text: str) -> str:
+    """Strip markdown code fences (```json ... ```) from an LLM response."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+
 def parse_score_response(raw: str) -> ScoreResult:
     """Parse the LLM JSON response into a ScoreResult. Returns null scores on failure."""
     try:
-        data = json.loads(raw)
+        data = json.loads(_strip_fences(raw))
         return ScoreResult(
             role_score=float(data["role_score"]),
             location_score=float(data["location_score"]),

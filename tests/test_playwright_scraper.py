@@ -253,7 +253,7 @@ def test_resolve_url_empty_href_returns_base():
 def test_inject_keywords_replaces_placeholder():
     url = "https://careers.example.com/jobs?keyword=__KEYWORDS__&location=Pittsburgh"
     result = _inject_keywords_into_url(url, "machine learning")
-    assert result == "https://careers.example.com/jobs?keyword=machine learning&location=Pittsburgh"
+    assert result == "https://careers.example.com/jobs?keyword=machine+learning&location=Pittsburgh"
 
 
 def test_inject_keywords_no_placeholder():
